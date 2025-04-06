@@ -1,0 +1,29 @@
+import pyautogui as pag, time, sys
+
+x = 473
+try:
+    while x > 75:
+        # Seleção do primeiro Item + Click 1
+        pag.moveTo(500, 130)
+        pag.click()
+        # time.sleep(1)
+        # Seleção do segundo Item + Click
+        pag.moveTo(500, 300)
+        pag.click()
+        # time.sleep(1)
+        # Seleção para Deletar os e-mails
+        pag.moveTo(1390, 135)
+        pag.click()
+        # time.sleep(1)
+        # Refresh
+        pag.moveTo(100, 75)
+        pag.click()
+        time.sleep(2)
+        # Escolha de pagina
+        pag.moveTo(400, 1000)
+        pag.click()
+        time.sleep(1)
+        x =+ x - 1
+except KeyboardInterrupt:
+    print('\n')
+    sys.exit()
