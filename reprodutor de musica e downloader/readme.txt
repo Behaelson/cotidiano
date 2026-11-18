@@ -4,4 +4,6 @@ pip install yt-dlp PyQt6 static-ffmpeg
 Rode o código:
 python ironmaiden.py
 
-Aproveite e me agradeça depois
+Dá para fazer a pasta ser um arquivo executável utilizando pyinstaller. Facilita o uso.
+
+O app Idle roda em 50mb de RAM e tocando musica, 60mb
