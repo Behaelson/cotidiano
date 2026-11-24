@@ -1,9 +1,13 @@
 import os
+import re
 import sys
+import ssl
+import json
+import html
 import random
 import threading
 from urllib.parse import quote_plus
-from urllib.request import urlopen
+from urllib.request import urlopen, Request
 import yt_dlp
 from PyQt6.QtCore import Qt, QDir, pyqtSignal, QTimer, QPoint, QEvent, QUrl, QSize
 from PyQt6.QtGui import QFileSystemModel, QPixmap, QColor, QIcon, QFont
@@ -24,6 +28,8 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QSlider,
+    QDialog,
+    QSizeGrip,
 )
 
 try:
@@ -87,11 +93,267 @@ class ItemSugestao(QFrame):
         super().mousePressEvent(evento)
 
 
+class DialogoSelecaoPlaylist(QDialog):
+    def __init__(self, titulo_playlist, faixas, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setModal(True)
+        self.setMinimumSize(460, 260)
+        self.resize(520, 480)
+        self.faixas = faixas
+        self.faixas_escolhidas = []
+        self.borda_arrasto = None
+        self.posicao_arrasto = None
+        self.geometria_inicial = None
+        self.margem_borda = 8
+
+        self.setMouseTracking(True)
+
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #2A2A32;
+                border: none;
+                border-radius: 0px;
+                font-family: Arial, sans-serif;
+            }
+            QLabel#tituloModal {
+                background-color: transparent;
+                color: #FFFFFF;
+                font-weight: bold;
+                font-size: 16px;
+            }
+            QLabel#contadorModal {
+                background-color: transparent;
+                color: #C5BFE3;
+                font-size: 12px;
+                font-weight: bold;
+            }
+            QPushButton#botaoAcaoModal {
+                background-color: #464652;
+                color: #FFFFFF;
+                border: none;
+                border-radius: 0px;
+                padding: 6px 12px;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            QPushButton#botaoAcaoModal:hover {
+                background-color: #5C5C6B;
+            }
+            QPushButton#botaoFecharModal {
+                background-color: #464652;
+                color: #FFFFFF;
+                border: none;
+                border-radius: 0px;
+                font-weight: bold;
+            }
+            QPushButton#botaoFecharModal:hover {
+                background-color: #5E5E6E;
+            }
+            QListWidget#listaModal {
+                background-color: #1D1D24;
+                color: #FFFFFF;
+                border: none;
+                border-radius: 0px;
+                font-size: 13px;
+                outline: none;
+            }
+            QListWidget#listaModal::item {
+                padding: 7px 8px;
+                border-bottom: 1px solid #2A2A34;
+            }
+            QListWidget#listaModal::item:hover {
+                background-color: #343442;
+            }
+            QPushButton#botaoCancelarModal {
+                background-color: #4A4A56;
+                color: #FFFFFF;
+                border: none;
+                border-radius: 0px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }
+            QPushButton#botaoCancelarModal:hover {
+                background-color: #5C5C6B;
+            }
+            QPushButton#botaoConfirmarModal {
+                background-color: #22B14C;
+                color: #FFFFFF;
+                border: none;
+                border-radius: 0px;
+                padding: 8px 18px;
+                font-weight: bold;
+                font-size: 14px;
+            }
+            QPushButton#botaoConfirmarModal:hover {
+                background-color: #1D9941;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        layout_topo = QHBoxLayout()
+        label_titulo = QLabel(f"Playlist: {titulo_playlist}")
+        label_titulo.setObjectName("tituloModal")
+        label_titulo.setWordWrap(True)
+
+        botao_fechar = QPushButton("✕")
+        botao_fechar.setObjectName("botaoFecharModal")
+        botao_fechar.setFixedSize(28, 28)
+        botao_fechar.setCursor(Qt.CursorShape.PointingHandCursor)
+        botao_fechar.clicked.connect(self.reject)
+
+        layout_topo.addWidget(label_titulo, stretch=1)
+        layout_topo.addWidget(botao_fechar, alignment=Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(layout_topo)
+
+        layout_filtros = QHBoxLayout()
+        layout_filtros.setSpacing(8)
+
+        botao_selecionar_tudo = QPushButton("Selecionar tudo")
+        botao_selecionar_tudo.setObjectName("botaoAcaoModal")
+        botao_selecionar_tudo.setCursor(Qt.CursorShape.PointingHandCursor)
+        botao_selecionar_tudo.clicked.connect(self.selecionar_tudo)
+
+        botao_remover_tudo = QPushButton("Remover tudo")
+        botao_remover_tudo.setObjectName("botaoAcaoModal")
+        botao_remover_tudo.setCursor(Qt.CursorShape.PointingHandCursor)
+        botao_remover_tudo.clicked.connect(self.remover_tudo)
+
+        self.label_contador = QLabel()
+        self.label_contador.setObjectName("contadorModal")
+
+        layout_filtros.addWidget(botao_selecionar_tudo)
+        layout_filtros.addWidget(botao_remover_tudo)
+        layout_filtros.addStretch()
+        layout_filtros.addWidget(self.label_contador)
+        layout.addLayout(layout_filtros)
+
+        self.lista_faixas = QListWidget()
+        self.lista_faixas.setObjectName("listaModal")
+        self.lista_faixas.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.lista_faixas.setWordWrap(True)
+        self.lista_faixas.itemChanged.connect(self.atualizar_contador)
+
+        for indice, faixa in enumerate(faixas, start=1):
+            duracao = faixa.get("duracao", "")
+            sufixo = f" ({duracao})" if duracao else ""
+            item = QListWidgetItem(f"{indice:02d}. {faixa.get('titulo', 'Sem título')}{sufixo}")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            item.setData(Qt.ItemDataRole.UserRole, faixa)
+            self.lista_faixas.addItem(item)
+
+        layout.addWidget(self.lista_faixas, stretch=1)
+
+        layout_rodape = QHBoxLayout()
+        layout_rodape.setSpacing(10)
+
+        botao_cancelar = QPushButton("Cancelar")
+        botao_cancelar.setObjectName("botaoCancelarModal")
+        botao_cancelar.setCursor(Qt.CursorShape.PointingHandCursor)
+        botao_cancelar.clicked.connect(self.reject)
+
+        botao_baixar = QPushButton("Baixar selecionadas")
+        botao_baixar.setObjectName("botaoConfirmarModal")
+        botao_baixar.setCursor(Qt.CursorShape.PointingHandCursor)
+        botao_baixar.clicked.connect(self.confirmar_selecao)
+
+        canto_redimensionar = QSizeGrip(self)
+        canto_redimensionar.setFixedSize(16, 16)
+
+        layout_rodape.addStretch()
+        layout_rodape.addWidget(botao_cancelar)
+        layout_rodape.addWidget(botao_baixar)
+        layout_rodape.addWidget(canto_redimensionar, alignment=Qt.AlignmentFlag.AlignBottom)
+        layout.addLayout(layout_rodape)
+
+        self.atualizar_contador()
+
+    def detectar_borda(self, pos):
+        if pos.y() <= self.margem_borda:
+            return "topo"
+        if pos.y() >= self.height() - self.margem_borda:
+            return "baixo"
+        if pos.y() <= 44:
+            return "mover"
+        return None
+
+    def mousePressEvent(self, evento):
+        if evento.button() == Qt.MouseButton.LeftButton:
+            self.borda_arrasto = self.detectar_borda(evento.position().toPoint())
+            self.posicao_arrasto = evento.globalPosition().toPoint()
+            self.geometria_inicial = self.geometry()
+        super().mousePressEvent(evento)
+
+    def mouseMoveEvent(self, evento):
+        pos_local = evento.position().toPoint()
+        if not self.borda_arrasto:
+            borda = self.detectar_borda(pos_local)
+            if borda in ("topo", "baixo"):
+                self.setCursor(Qt.CursorShape.SizeVerCursor)
+            else:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+        else:
+            delta = evento.globalPosition().toPoint() - self.posicao_arrasto
+            geo = self.geometria_inicial
+            if self.borda_arrasto == "mover":
+                self.move(geo.topLeft() + delta)
+            elif self.borda_arrasto == "baixo":
+                nova_altura = max(self.minimumHeight(), geo.height() + delta.y())
+                self.resize(geo.width(), nova_altura)
+            elif self.borda_arrasto == "topo":
+                nova_altura = max(self.minimumHeight(), geo.height() - delta.y())
+                novo_y = geo.bottom() - nova_altura + 1
+                self.setGeometry(geo.x(), novo_y, geo.width(), nova_altura)
+        super().mouseMoveEvent(evento)
+
+    def mouseReleaseEvent(self, evento):
+        self.borda_arrasto = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        super().mouseReleaseEvent(evento)
+
+    def selecionar_tudo(self):
+        self.lista_faixas.blockSignals(True)
+        for i in range(self.lista_faixas.count()):
+            self.lista_faixas.item(i).setCheckState(Qt.CheckState.Checked)
+        self.lista_faixas.blockSignals(False)
+        self.atualizar_contador()
+
+    def remover_tudo(self):
+        self.lista_faixas.blockSignals(True)
+        for i in range(self.lista_faixas.count()):
+            self.lista_faixas.item(i).setCheckState(Qt.CheckState.Unchecked)
+        self.lista_faixas.blockSignals(False)
+        self.atualizar_contador()
+
+    def atualizar_contador(self):
+        total = self.lista_faixas.count()
+        marcadas = sum(
+            1
+            for i in range(total)
+            if self.lista_faixas.item(i).checkState() == Qt.CheckState.Checked
+        )
+        self.label_contador.setText(f"{marcadas} de {total} selecionadas")
+
+    def confirmar_selecao(self):
+        escolhidas = []
+        for i in range(self.lista_faixas.count()):
+            item = self.lista_faixas.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                escolhidas.append(item.data(Qt.ItemDataRole.UserRole))
+        self.faixas_escolhidas = escolhidas
+        self.accept()
+
+
 class JanelaPrincipal(QWidget):
     sinal_status = pyqtSignal(str)
     sinal_concluido = pyqtSignal(bool)
     sinal_resultados = pyqtSignal(int, list)
     sinal_thumbnail = pyqtSignal(int, int, bytes)
+    sinal_playlist_pronta = pyqtSignal(str, list, str)
 
     def __init__(self):
         super().__init__()
@@ -149,6 +411,7 @@ class JanelaPrincipal(QWidget):
         self.sinal_concluido.connect(self.finalizar_download)
         self.sinal_resultados.connect(self.preencher_sugestoes)
         self.sinal_thumbnail.connect(self.aplicar_thumbnail)
+        self.sinal_playlist_pronta.connect(self.abrir_selecao_playlist)
 
         self.tocador.mediaStatusChanged.connect(self.ao_mudar_status_midia)
         self.tocador.playbackStateChanged.connect(self.ao_mudar_estado_reproducao)
@@ -179,7 +442,7 @@ class JanelaPrincipal(QWidget):
         layout_principal.setSpacing(12)
 
         self.barra_pesquisa = QLineEdit()
-        self.barra_pesquisa.setPlaceholderText("Cole o link do YouTube ou digite o nome da música...")
+        self.barra_pesquisa.setPlaceholderText("Cole o link (YouTube/Spotify) ou digite o nome da música...")
         self.barra_pesquisa.setFixedHeight(48)
         self.barra_pesquisa.textChanged.connect(self.ao_digitar_pesquisa)
         self.barra_pesquisa.returnPressed.connect(self.iniciar_download)
@@ -434,12 +697,6 @@ class JanelaPrincipal(QWidget):
         self.painel_fila = QFrame(self)
         self.painel_fila.setObjectName("painelFila")
         self.painel_fila.hide()
-
-        sombra = QGraphicsDropShadowEffect(self)
-        sombra.setBlurRadius(24)
-        sombra.setOffset(0, 6)
-        sombra.setColor(QColor(0, 0, 0, 170))
-        self.painel_fila.setGraphicsEffect(sombra)
 
         layout_fila = QVBoxLayout(self.painel_fila)
         layout_fila.setContentsMargins(16, 14, 16, 14)
@@ -765,7 +1022,7 @@ class JanelaPrincipal(QWidget):
             QFrame#painelFila {
                 background-color: #7D7D82;
                 border: 1px solid #58585E;
-                border-radius: 6px;
+                border-radius: 0px;
             }
             QLabel#tituloListaFlutuante {
                 background-color: transparent;
@@ -777,7 +1034,7 @@ class JanelaPrincipal(QWidget):
                 background-color: #66666B;
                 color: #FFFFFF;
                 border: none;
-                border-radius: 4px;
+                border-radius: 0px;
                 font-weight: bold;
             }
             QPushButton#botaoFecharLista:hover {
@@ -787,7 +1044,7 @@ class JanelaPrincipal(QWidget):
                 background-color: #6E6E73;
                 color: #FFFFFF;
                 border: none;
-                border-radius: 4px;
+                border-radius: 0px;
                 font-size: 13px;
                 outline: none;
             }
@@ -878,7 +1135,12 @@ class JanelaPrincipal(QWidget):
                     self.popup_volume.hide()
 
         elif evento.type() == QEvent.Type.KeyPress:
-            if evento.key() == Qt.Key.Key_Escape:
+            if evento.key() == Qt.Key.Key_Space and self.isActiveWindow():
+                foco = QApplication.focusWidget()
+                if not isinstance(foco, QLineEdit):
+                    self.alternar_play_pause()
+                    return True
+            elif evento.key() == Qt.Key.Key_Escape:
                 if self.aba_sugestoes.isVisible():
                     self.aba_sugestoes.hide()
                 if self.popup_volume.isVisible():
@@ -1305,8 +1567,223 @@ class JanelaPrincipal(QWidget):
             return f"https://i.ytimg.com/vi/{id_video}/mqdefault.jpg"
         return ""
 
+    def obter_contexto_ssl(self):
+        contexto = ssl.create_default_context()
+        contexto.check_hostname = False
+        contexto.verify_mode = ssl.CERT_NONE
+        return contexto
+
+    def normalizar_url_spotify(self, texto):
+        url = texto.strip()
+        if url.startswith(("open.spotify.com/", "spotify.link/", "spoti.fi/")):
+            url = "https://" + url
+        if url.startswith(("https://spotify.link/", "https://spoti.fi/")):
+            try:
+                req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urlopen(req, timeout=8, context=self.obter_contexto_ssl()) as resp:
+                    url = resp.geturl()
+            except Exception:
+                pass
+        return url
+
+    def extrair_id_spotify_playlist(self, texto):
+        url = self.normalizar_url_spotify(texto)
+        padrao = re.search(
+            r"(?:open\.spotify\.com/(?:intl-[a-z-]+/)?playlist/|spotify:playlist:)([a-zA-Z0-9]+)",
+            url,
+        )
+        if padrao:
+            return padrao.group(1)
+        return None
+
+    def extrair_id_spotify_faixa(self, texto):
+        url = self.normalizar_url_spotify(texto)
+        padrao = re.search(
+            r"(?:open\.spotify\.com/(?:intl-[a-z-]+/)?track/|spotify:track:)([a-zA-Z0-9]+)",
+            url,
+        )
+        if padrao:
+            return padrao.group(1)
+        return None
+
+    def ler_playlist_spotify(self, id_playlist):
+        url_embed = f"https://open.spotify.com/embed/playlist/{id_playlist}"
+        req = Request(
+            url_embed,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+            },
+        )
+        with urlopen(req, timeout=12, context=self.obter_contexto_ssl()) as resp:
+            pagina = resp.read().decode("utf-8", errors="ignore")
+
+        titulo_playlist = "Playlist Spotify"
+        capa_url = ""
+        faixas = []
+
+        bloco_json = re.search(
+            r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+            pagina,
+            re.DOTALL,
+        )
+        if bloco_json:
+            try:
+                dados = json.loads(bloco_json.group(1))
+                entidade = (
+                    dados.get("props", {})
+                    .get("pageProps", {})
+                    .get("state", {})
+                    .get("data", {})
+                    .get("entity", {})
+                )
+                if entidade:
+                    titulo_playlist = html.unescape(
+                        entidade.get("name") or entidade.get("title") or titulo_playlist
+                    )
+                    imagens_capa = entidade.get("coverArt", {}).get("sources") or []
+                    if imagens_capa:
+                        capa_url = imagens_capa[0].get("url", "")
+
+                    for item in entidade.get("trackList") or []:
+                        nome_musica = html.unescape(item.get("title") or "").strip()
+                        artista = html.unescape(item.get("subtitle") or "").strip()
+                        if not nome_musica:
+                            continue
+                        titulo_completo = f"{artista} - {nome_musica}" if artista else nome_musica
+                        duracao_ms = item.get("duration") or 0
+                        duracao_fmt = self.formatar_duracao(duracao_ms // 1000) if duracao_ms else ""
+                        faixas.append(
+                            {
+                                "titulo": titulo_completo,
+                                "url": f"ytsearch1:{titulo_completo}",
+                                "duracao": duracao_fmt if duracao_fmt != "0:00" else "",
+                            }
+                        )
+            except Exception:
+                pass
+
+        if not faixas:
+            titulo_og = re.search(r'<meta property="og:title" content="(.*?)"', pagina)
+            if titulo_og:
+                titulo_playlist = html.unescape(titulo_og.group(1)).strip()
+
+            pares = re.findall(
+                r'"title"\s*:\s*"([^"]+)"\s*,\s*"subtitle"\s*:\s*"([^"]+)"',
+                pagina,
+            )
+            for nome_raw, artista_raw in pares:
+                try:
+                    nome_musica = json.loads(f'"{nome_raw}"').strip()
+                    artista = json.loads(f'"{artista_raw}"').strip()
+                except Exception:
+                    nome_musica = html.unescape(nome_raw).strip()
+                    artista = html.unescape(artista_raw).strip()
+
+                if not nome_musica or nome_musica == titulo_playlist:
+                    continue
+                titulo_completo = f"{artista} - {nome_musica}" if artista else nome_musica
+                faixas.append(
+                    {
+                        "titulo": titulo_completo,
+                        "url": f"ytsearch1:{titulo_completo}",
+                        "duracao": "",
+                    }
+                )
+
+        return titulo_playlist, faixas, capa_url
+
+    def ler_faixa_spotify(self, id_faixa):
+        url_embed = f"https://open.spotify.com/embed/track/{id_faixa}"
+        req = Request(
+            url_embed,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+            },
+        )
+        with urlopen(req, timeout=12, context=self.obter_contexto_ssl()) as resp:
+            pagina = resp.read().decode("utf-8", errors="ignore")
+
+        bloco_json = re.search(
+            r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+            pagina,
+            re.DOTALL,
+        )
+        if bloco_json:
+            try:
+                dados = json.loads(bloco_json.group(1))
+                entidade = (
+                    dados.get("props", {})
+                    .get("pageProps", {})
+                    .get("state", {})
+                    .get("data", {})
+                    .get("entity", {})
+                )
+                nome_musica = html.unescape(entidade.get("name") or entidade.get("title") or "").strip()
+                artistas = [
+                    html.unescape(a.get("name", ""))
+                    for a in entidade.get("artists") or []
+                    if a.get("name")
+                ]
+                artista = (
+                    ", ".join(artistas)
+                    if artistas
+                    else html.unescape(entidade.get("subtitle") or "").strip()
+                )
+                if nome_musica:
+                    return f"{artista} - {nome_musica}" if artista else nome_musica
+            except Exception:
+                pass
+
+        titulo_og = re.search(r'<title>(.*?)</title>', pagina)
+        if titulo_og:
+            texto_titulo = html.unescape(titulo_og.group(1)).replace("| Spotify", "").strip()
+            if texto_titulo:
+                return texto_titulo
+        return None
+    
     def buscar_opcoes_youtube(self, id_busca, termo, modo):
         try:
+            id_sp_playlist = self.extrair_id_spotify_playlist(termo)
+            if id_sp_playlist:
+                titulo_sp, faixas_sp, capa_sp = self.ler_playlist_spotify(id_sp_playlist)
+                if titulo_sp:
+                    resultados_sp = [
+                        {
+                            "titulo": titulo_sp,
+                            "detalhe": f"Spotify • Playlist ({len(faixas_sp)} músicas)",
+                            "url": termo,
+                            "thumb": capa_sp,
+                        }
+                    ]
+                    self.sinal_resultados.emit(id_busca, resultados_sp)
+                    if capa_sp:
+                        try:
+                            with urlopen(capa_sp, timeout=5) as resposta:
+                                dados_img = resposta.read()
+                            self.sinal_thumbnail.emit(id_busca, 0, dados_img)
+                        except Exception:
+                            pass
+                    return
+
+            id_sp_faixa = self.extrair_id_spotify_faixa(termo)
+            if id_sp_faixa:
+                consulta_sp = self.ler_faixa_spotify(id_sp_faixa)
+                if consulta_sp:
+                    resultados_faixa = self.pesquisar_lista(consulta_sp, "video", limite=5)
+                    self.sinal_resultados.emit(id_busca, resultados_faixa[:5])
+                    for indice, item in enumerate(resultados_faixa[:5]):
+                        url_thumb = item.get("thumb")
+                        if url_thumb:
+                            try:
+                                with urlopen(url_thumb, timeout=5) as resposta:
+                                    dados_img = resposta.read()
+                                self.sinal_thumbnail.emit(id_busca, indice, dados_img)
+                            except Exception:
+                                pass
+                    return
+
             eh_link = termo.startswith(("http://", "https://"))
             resultados = []
 
@@ -1508,85 +1985,181 @@ class JanelaPrincipal(QWidget):
             self.texto_status.setText("Digite um nome ou cole um link.")
             return
 
+        if self.extrair_id_spotify_playlist(termo) and self.modo_filtro != "playlist":
+            self.selecionar_playlist()
+
         self.botao_download.setEnabled(False)
-        self.texto_status.setText("Processando...")
 
-        tarefa = threading.Thread(
-            target=self.executar_download,
-            args=(termo, self.modo_filtro, self.pasta_destino),
-            daemon=True,
-        )
-        tarefa.start()
+        if self.modo_filtro == "video":
+            self.texto_status.setText("Processando...")
+            tarefa = threading.Thread(
+                target=self.executar_download_video,
+                args=(termo, self.pasta_destino),
+                daemon=True,
+            )
+            tarefa.start()
+        else:
+            self.texto_status.setText("Carregando playlist...")
+            tarefa = threading.Thread(
+                target=self.carregar_faixas_playlist,
+                args=(termo, self.pasta_destino),
+                daemon=True,
+            )
+            tarefa.start()
 
-    def executar_download(self, termo, modo, destino):
+    def executar_download_video(self, termo, destino):
         try:
-            eh_link = termo.startswith(("http://", "https://"))
-
-            if modo == "video":
-                alvo = termo if eh_link else f"ytsearch1:{termo}"
-                opcoes = {
-                    "format": "bestaudio/best",
-                    "outtmpl": os.path.join(destino, "%(title)s.%(ext)s"),
-                    "noplaylist": True,
-                    "playlist_items": "1",
-                    "quiet": True,
-                    "no_warnings": True,
-                    "postprocessors": [
-                        {
-                            "key": "FFmpegExtractAudio",
-                            "preferredcodec": "mp3",
-                            "preferredquality": "192",
-                        },
-                        {
-                            "key": "FFmpegMetadata",
-                            "add_metadata": True,
-                        },
-                    ],
-                }
-                self.sinal_status.emit("Baixando áudio...")
-                with yt_dlp.YoutubeDL(opcoes) as ydl:
-                    ydl.download([alvo])
-
+            id_sp_faixa = self.extrair_id_spotify_faixa(termo)
+            if id_sp_faixa:
+                consulta_sp = self.ler_faixa_spotify(id_sp_faixa)
+                if not consulta_sp:
+                    self.sinal_status.emit("Erro ao ler faixa do Spotify.")
+                    self.sinal_concluido.emit(False)
+                    return
+                alvo = f"ytsearch1:{consulta_sp}"
             else:
-                if eh_link:
-                    alvo = termo
-                else:
-                    self.sinal_status.emit("Buscando playlist...")
-                    url_busca = (
-                        f"https://www.youtube.com/results?search_query={quote_plus(termo)}&sp=EgIQAw%3D%3D"
-                    )
-                    opcoes_busca = {
-                        "quiet": True,
-                        "extract_flat": True,
-                        "playlistend": 1,
-                    }
-                    with yt_dlp.YoutubeDL(opcoes_busca) as ydl_busca:
-                        info_busca = ydl_busca.extract_info(url_busca, download=False)
-                        entradas = info_busca.get("entries") or []
-                        if not entradas:
-                            self.sinal_status.emit("Nenhuma playlist encontrada.")
-                            self.sinal_concluido.emit(False)
-                            return
-                        alvo = entradas[0].get("url")
+                eh_link = termo.startswith(("http://", "https://"))
+                alvo = termo if eh_link else f"ytsearch1:{termo}"
 
-                opcoes_info = {
+            opcoes = {
+                "format": "bestaudio/best",
+                "outtmpl": os.path.join(destino, "%(title)s.%(ext)s"),
+                "noplaylist": True,
+                "playlist_items": "1",
+                "quiet": True,
+                "no_warnings": True,
+                "postprocessors": [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "192",
+                    },
+                    {
+                        "key": "FFmpegMetadata",
+                        "add_metadata": True,
+                    },
+                ],
+            }
+            self.sinal_status.emit("Baixando áudio...")
+            with yt_dlp.YoutubeDL(opcoes) as ydl:
+                ydl.download([alvo])
+
+            self.sinal_status.emit("Download concluído!")
+            self.sinal_concluido.emit(True)
+        except Exception as erro:
+            self.sinal_status.emit(f"Erro: {str(erro)[:40]}")
+            self.sinal_concluido.emit(False)
+
+    def carregar_faixas_playlist(self, termo, destino):
+        try:
+            id_sp_playlist = self.extrair_id_spotify_playlist(termo)
+            if id_sp_playlist:
+                titulo_sp, faixas_sp, _ = self.ler_playlist_spotify(id_sp_playlist)
+                if not faixas_sp:
+                    self.sinal_status.emit("Playlist do Spotify vazia ou privada.")
+                    self.sinal_concluido.emit(False)
+                    return
+                self.sinal_playlist_pronta.emit(titulo_sp, faixas_sp, destino)
+                return
+
+            eh_link = termo.startswith(("http://", "https://"))
+            if eh_link:
+                alvo = termo
+            else:
+                url_busca = (
+                    f"https://www.youtube.com/results?search_query={quote_plus(termo)}&sp=EgIQAw%3D%3D"
+                )
+                opcoes_busca = {
                     "quiet": True,
                     "no_warnings": True,
                     "extract_flat": True,
                     "playlistend": 1,
                 }
-                with yt_dlp.YoutubeDL(opcoes_info) as ydl_info:
-                    info_playlist = ydl_info.extract_info(alvo, download=False)
-                    titulo_bruto = (info_playlist or {}).get("title") or "Playlist"
+                with yt_dlp.YoutubeDL(opcoes_busca) as ydl_busca:
+                    info_busca = ydl_busca.extract_info(url_busca, download=False)
+                    entradas_busca = info_busca.get("entries") or []
+                    if not entradas_busca:
+                        self.sinal_status.emit("Nenhuma playlist encontrada.")
+                        self.sinal_concluido.emit(False)
+                        return
+                    alvo = entradas_busca[0].get("url")
 
-                nome_pasta_playlist = yt_dlp.utils.sanitize_filename(titulo_bruto).strip() or "Playlist"
-                destino_playlist = os.path.join(destino, nome_pasta_playlist)
-                os.makedirs(destino_playlist, exist_ok=True)
+            opcoes_playlist = {
+                "quiet": True,
+                "no_warnings": True,
+                "extract_flat": True,
+            }
+            with yt_dlp.YoutubeDL(opcoes_playlist) as ydl:
+                info = ydl.extract_info(alvo, download=False)
 
-                opcoes_playlist = {
+            if not info:
+                self.sinal_status.emit("Erro ao ler playlist.")
+                self.sinal_concluido.emit(False)
+                return
+
+            titulo_playlist = info.get("title") or "Playlist"
+            faixas = []
+            for entrada in info.get("entries") or []:
+                if not entrada:
+                    continue
+                url_faixa = entrada.get("url")
+                if not url_faixa and entrada.get("id"):
+                    url_faixa = f"https://www.youtube.com/watch?v={entrada.get('id')}"
+                if not url_faixa:
+                    continue
+                duracao_fmt = self.formatar_duracao(entrada.get("duration"))
+                faixas.append(
+                    {
+                        "titulo": entrada.get("title") or "Sem título",
+                        "url": url_faixa,
+                        "duracao": duracao_fmt if duracao_fmt != "0:00" else "",
+                    }
+                )
+
+            if not faixas:
+                self.sinal_status.emit("Playlist vazia.")
+                self.sinal_concluido.emit(False)
+                return
+
+            self.sinal_playlist_pronta.emit(titulo_playlist, faixas, destino)
+        except Exception as erro:
+            self.sinal_status.emit(f"Erro: {str(erro)[:40]}")
+            self.sinal_concluido.emit(False)
+
+    def abrir_selecao_playlist(self, titulo_playlist, faixas, destino):
+        self.texto_status.setText("Selecione as músicas...")
+        dialogo = DialogoSelecaoPlaylist(titulo_playlist, faixas, self)
+        if dialogo.exec() == QDialog.DialogCode.Accepted and dialogo.faixas_escolhidas:
+            tarefa = threading.Thread(
+                target=self.executar_download_faixas_selecionadas,
+                args=(titulo_playlist, dialogo.faixas_escolhidas, destino),
+                daemon=True,
+            )
+            tarefa.start()
+        else:
+            self.texto_status.setText("Pronto")
+            self.botao_download.setEnabled(True)
+
+    def executar_download_faixas_selecionadas(self, titulo_playlist, faixas, destino):
+        try:
+            nome_pasta = yt_dlp.utils.sanitize_filename(titulo_playlist).strip() or "Playlist"
+            destino_playlist = os.path.join(destino, nome_pasta)
+            os.makedirs(destino_playlist, exist_ok=True)
+
+            total = len(faixas)
+            for indice, faixa in enumerate(faixas, start=1):
+                self.sinal_status.emit(f"Baixando {indice}/{total}...")
+                eh_busca_sp = faixa["url"].startswith("ytsearch1:")
+                modelo_saida = (
+                    f"{indice:02d} - {yt_dlp.utils.sanitize_filename(faixa['titulo'])}.%(ext)s"
+                    if eh_busca_sp
+                    else f"{indice:02d} - %(title)s.%(ext)s"
+                )
+                opcoes = {
                     "format": "bestaudio/best",
-                    "outtmpl": os.path.join(destino_playlist, "%(playlist_index)s - %(title)s.%(ext)s"),
-                    "noplaylist": False,
+                    "outtmpl": os.path.join(destino_playlist, modelo_saida),
+                    "noplaylist": True,
+                    "playlist_items": "1",
                     "ignoreerrors": True,
                     "quiet": True,
                     "no_warnings": True,
@@ -1602,13 +2175,11 @@ class JanelaPrincipal(QWidget):
                         },
                     ],
                 }
-                self.sinal_status.emit(f"Baixando: {nome_pasta_playlist[:22]}...")
-                with yt_dlp.YoutubeDL(opcoes_playlist) as ydl_playlist:
-                    ydl_playlist.download([alvo])
+                with yt_dlp.YoutubeDL(opcoes) as ydl:
+                    ydl.download([faixa["url"]])
 
             self.sinal_status.emit("Download concluído!")
             self.sinal_concluido.emit(True)
-
         except Exception as erro:
             self.sinal_status.emit(f"Erro: {str(erro)[:40]}")
             self.sinal_concluido.emit(False)
